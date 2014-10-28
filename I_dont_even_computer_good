@@ -1,0 +1,244 @@
+import requests
+import urlparse
+import sqlite3
+from lxml import html
+
+'''
+parent_url is the root / site e.g. http://foo.com/  This is the site that will be spidered.
+all_links means ALL links on the page, which is mostly noise
+local_links means links on the page relative to the site. e.g. /blog /contact rather than http://site.com/blog
+hard_links means fully qualified links irrespective of the site. e.g http://site.com/blog rather than /blog
+all_page_links are a union of both the local_links and the hard_links
+master_set is the True unique index of every useful link on the site that we've seen so far
+'''
+
+url = 'http://heptal.com'
+max_depth = 1
+
+# base url merging
+# static asset recording
+
+
+class LinkDB():
+    def __init__(self, url):
+        self.link_db = {}
+        self.max_depth = max_depth
+        self.domain = urlparse.urlparse(url).hostname
+        self.base_url = urlparse.urlparse(url).scheme + '://' + self.domain
+
+        self.link_db[url] = {
+            'url': url,
+            'depth': 0,
+            'seen': False,
+            'internal': True,
+            'static': False,
+            'status_code': None
+        }
+
+        self.static_extensions = (
+            '.jpg',
+            '.jpeg',
+            '.png',
+            '.gif',
+            '.ico',
+            '.swf',
+            '.css',
+        )
+
+        self.bad_status_codes = (
+            400,
+        )
+
+        self.db = sqlite3.Connection('crawl.db', isolation_level=None)
+        self.create_table()
+
+
+    def add_link(self, url, depth):
+        if self.link_db.get(url):
+            return
+
+        internal = True if self.domain in url else False
+        static = True if url.endswith(self.static_extensions) else False
+
+        self.link_db[url] = {
+            'url': url,
+            'depth': depth,
+            'seen': False,
+            'internal': internal,
+            'static': static,
+            'status_code': None
+        }
+
+        sql = """INSERT OR REPLACE INTO 
+            crawl(
+            start_url,
+            url,
+            depth,
+            seen,
+            internal,
+            static,
+            status_code
+            )
+            VALUES (
+            '{start_url}',
+            '{url}',
+            {depth},
+            {seen},
+            {internal},
+            {static},
+            {status_code}
+            )
+            """
+
+        values_dict = {
+            'start_url': self.base_url,
+            'url': url,
+            'depth': depth,
+            'seen': 0,
+            'internal': int(internal),
+            'static': int(static),
+            'status_code': 0
+        }
+
+        self.db.execute(sql.format(**values_dict))
+
+    def create_table(self):
+        sql = """CREATE TABLE crawl (
+                start_url TEXT,
+                url TEXT,
+                depth INTEGER,
+                seen INTEGER,
+                internal INTEGER,
+                static INTEGER,
+                status_code INTEGER,
+
+                PRIMARY KEY (start_url, url)
+                )
+            """
+        try:
+            self.db.execute(sql)
+            print "created table 'crawl'"
+
+        except(sqlite3.OperationalError):
+            print "table 'crawl' already exists"
+            return
+
+    def mark_seen(self, url):
+        self.link_db[url]['seen'] = True
+
+        self.db.execute("""UPDATE crawl
+            SET seen=1
+            WHERE url='%s'
+            AND start_url='%s'
+            """ % (url, self.base_url))
+
+    def mark_static(self, url):
+        self.link_db[url]['static'] = True
+
+        self.db.execute("""UPDATE crawl
+            SET static=1
+            WHERE url='%s'
+            AND start_url='%s'
+            """ % (url, self.base_url))
+
+    def mark_status_code(self, url, status_code):
+        self.link_db[url]['status_code'] = status_code
+
+        self.db.execute("""UPDATE crawl
+            SET status_code=%s
+            WHERE url='%s'
+            AND start_url='%s'
+            """ % (status_code, url, self.base_url))
+
+    def get_depth(self, url):
+        return self.link_db[url]['depth']
+
+    def is_static(self, url):
+        return self.link_db[url]['static']
+
+    def is_internal(self, url):
+        return self.link_db[url]['internal']
+
+    def get_remaining_links(self):
+        links = [link['url'] for link in self.link_db.values() if not link['seen']]
+
+        # only return internal links
+        links = filter(lambda x: self.link_db[x]['internal'], links)
+
+        # only return non-static assets
+        links = filter(lambda x: not self.link_db[x]['static'], links)
+
+        # only return links within depth
+        links = filter(lambda x: self.link_db[x]['depth'] <= self.max_depth, links)
+
+        return links
+
+    def print_all(self):
+        for link in [link['url'] for link in self.link_db.values()]:
+            print link
+
+    def get_child_links(self, url):
+        current_depth = self.get_depth(url)
+        if current_depth > self.max_depth:
+            return
+
+        if self.is_static(url):
+            print 'Static asset. Not crawling.'
+            return
+
+        if not self.is_internal(url):
+            print 'External link. Not crawling.'
+            return
+
+        print 'Getting links for %s ...' % url
+
+        try:
+            r = requests.get(url, timeout=10)
+            self.mark_status_code(url, r.status_code)
+            if r.status_code in self.bad_status_codes:
+                self.mark_seen(url)
+                return
+
+        except (requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError):
+            print url + " timed out after 10 seconds\n"
+            return
+
+        self.mark_seen(url)
+
+        if not 'text/html' in r.headers['content-type']:
+            self.mark_static(url)
+            return  # you shall not pass, which is for stubbing out methods
+
+        # finally do the parsing
+        tree = html.fromstring(r.content)
+
+        page_links = set([x[2] for x in tree.iterlinks()])
+
+        for link in page_links:
+            linkIsTooLong = True if len(link) > 999 else False
+            if linkIsTooLong:
+                print 'Long url is loooong. Not saving %s' % url
+                continue
+
+            if 'signup' in link:
+                print link
+            link = urlparse.urljoin(self.base_url, link)
+            if 'signup' in link:
+                print link
+
+            self.add_link(link, current_depth + 1)
+
+
+link_db = LinkDB(url)
+links_remaining = True
+
+while links_remaining:
+    for url in link_db.get_remaining_links():
+        link_db.get_child_links(url)
+    links_remaining = True if len(link_db.get_remaining_links()) > 0 else False
+
+
+print 'finished. final url list:'
+link_db.print_all()
